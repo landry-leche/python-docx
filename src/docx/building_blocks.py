@@ -1,0 +1,441 @@
+"""Collection providing access to the Word building blocks of a document.
+
+Word calls these "building blocks" (Quick Parts, AutoText, cover pages, headers, footers,
+equations, and so on); in the file format they are `w:docPart` elements of the *glossary
+document*, a part related to the main document part.
+"""
+
+from __future__ import annotations
+
+import copy
+from typing import TYPE_CHECKING, Iterable, Iterator, Sequence, cast
+
+from docx.blkcntnr import BlockItemContainer
+from docx.enum.building_block import (
+    WD_BUILDING_BLOCK_BEHAVIOR,
+    WD_BUILDING_BLOCK_GALLERY,
+    WD_BUILDING_BLOCK_TYPE,
+)
+from docx.oxml.glossary import DEFAULT_CATEGORY_NAME
+from docx.oxml.ns import nsmap, qn
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+
+if TYPE_CHECKING:
+    from docx.document import Document
+    from docx.oxml.glossary import CT_DocPart
+    from docx.oxml.xmlchemy import BaseOxmlElement
+    from docx.parts.document import DocumentPart
+    from docx.parts.glossary import GlossaryPart
+    from docx.parts.story import StoryPart
+
+_R_NS_PREFIX = "{%s}" % nsmap["r"]
+
+# -- the elements `append_to()` knows to be block-item containers --
+_BLOCK_CONTAINER_TAGS = frozenset(
+    qn(tag) for tag in ("w:body", "w:tc", "w:hdr", "w:ftr", "w:comment", "w:docPartBody")
+)
+
+
+class BuildingBlocks:
+    """Collection of the building blocks (Quick Parts, AutoText, etc.) of a document.
+
+    Obtained from `document.building_blocks`. Reading never modifies the document: the
+    glossary part that stores building blocks is only created when the first one is added.
+    """
+
+    def __init__(self, document_part: DocumentPart):
+        self._document_part = document_part
+
+    def __iter__(self) -> Iterator[BuildingBlock]:
+        """Iterate over the building blocks in this collection, in file order."""
+        glossary_part = self._document_part.glossary_part
+        if glossary_part is None:
+            return
+        doc_parts = glossary_part.element.docParts
+        if doc_parts is None:
+            return
+        for doc_part in doc_parts.docPart_lst:
+            yield BuildingBlock(doc_part, glossary_part)
+
+    def __len__(self) -> int:
+        """The number of building blocks in this collection."""
+        return sum(1 for _ in self)
+
+    def add(
+        self,
+        name: str,
+        text: str = "",
+        *,
+        gallery: WD_BUILDING_BLOCK_GALLERY = WD_BUILDING_BLOCK_GALLERY.DOCUMENT_PARTS,
+        category: str = DEFAULT_CATEGORY_NAME,
+        description: str | None = None,
+        types: Iterable[WD_BUILDING_BLOCK_TYPE] = (WD_BUILDING_BLOCK_TYPE.NORMAL,),
+        behaviors: Iterable[WD_BUILDING_BLOCK_BEHAVIOR] = (WD_BUILDING_BLOCK_BEHAVIOR.CONTENT,),
+    ) -> BuildingBlock:
+        """Add a new building block and return it.
+
+        `name` must be unique within its `gallery` and `category`; |ValueError| is raised
+        otherwise. The defaults produce what Word calls a custom Quick Part: gallery "Quick
+        Parts" (`DOCUMENT_PARTS`), category "General", "Insert content" behavior.
+
+        The block always starts with one paragraph (Word does not allow an empty building
+        block). If `text` is provided it is placed in that paragraph, and each additional
+        line (separated by `"\\n"`) becomes a further paragraph. Richer content can be added
+        afterward with the returned block's `add_paragraph()`, `add_table()` and the
+        paragraphs it exposes.
+        """
+        block = self._add_block(name, gallery, category, description, types, behaviors)
+        if text:
+            first_line, *more_lines = text.split("\n")
+            block.paragraphs[0].add_run(first_line)
+            for line in more_lines:
+                block.add_paragraph(line)
+        return block
+
+    def add_from(
+        self,
+        name: str,
+        items: Sequence[Paragraph | Table],
+        *,
+        gallery: WD_BUILDING_BLOCK_GALLERY = WD_BUILDING_BLOCK_GALLERY.DOCUMENT_PARTS,
+        category: str = DEFAULT_CATEGORY_NAME,
+        description: str | None = None,
+        types: Iterable[WD_BUILDING_BLOCK_TYPE] = (WD_BUILDING_BLOCK_TYPE.NORMAL,),
+        behaviors: Iterable[WD_BUILDING_BLOCK_BEHAVIOR] = (WD_BUILDING_BLOCK_BEHAVIOR.CONTENT,),
+    ) -> BuildingBlock:
+        """Add a new building block holding a copy of `items` and return it.
+
+        This is the equivalent of selecting content in Word and choosing "Save Selection to
+        Quick Part Gallery". `items` is a non-empty sequence of |Paragraph| and |Table|
+        objects, typically taken from `document.paragraphs`, `document.tables` or
+        `document.iter_inner_content()`. The originals are left untouched. Images and
+        hyperlinks in the content are carried over along with their relationships.
+        """
+        if not items:
+            raise ValueError("`items` must contain at least one paragraph or table")
+        block = self._add_block(name, gallery, category, description, types, behaviors)
+        body = block._element  # pyright: ignore[reportPrivateUsage]
+        for p in list(body.p_lst):
+            body.remove(p)
+        for item in items:
+            clone = copy.deepcopy(item._element)  # pyright: ignore[reportPrivateUsage]
+            _remap_relationships([clone], item.part, block.part)
+            body.append(clone)
+        # -- Word requires a story to end with a paragraph, never a table --
+        if body.inner_content_elements and not isinstance(body.inner_content_elements[-1], CT_P):
+            body.add_p()
+        return block
+
+    def find(
+        self,
+        name: str | None = None,
+        *,
+        gallery: WD_BUILDING_BLOCK_GALLERY | None = None,
+        category: str | None = None,
+    ) -> list[BuildingBlock]:
+        """List of building blocks matching all the criteria given, in file order.
+
+        A criterion left as |None| matches anything. `name` and `category` are compared
+        exactly (case-sensitive).
+        """
+        return [
+            block
+            for block in self
+            if (name is None or block.name == name)
+            and (gallery is None or block.gallery == gallery)
+            and (category is None or block.category == category)
+        ]
+
+    def get(
+        self,
+        name: str,
+        *,
+        gallery: WD_BUILDING_BLOCK_GALLERY | None = None,
+        category: str | None = None,
+    ) -> BuildingBlock | None:
+        """The first building block named `name`, or |None| if there isn't one.
+
+        Names are unique only within a gallery and category, so pass `gallery` and/or
+        `category` to disambiguate when needed.
+        """
+        matches = self.find(name, gallery=gallery, category=category)
+        return matches[0] if matches else None
+
+    def remove(self, block: BuildingBlock) -> None:
+        """Remove `block` from the document.
+
+        Relationships (images, hyperlinks) that only that building block used are removed
+        along with it. The `block` object must not be used afterward.
+        """
+        glossary_part = self._document_part.glossary_part
+        doc_part = block._doc_part  # pyright: ignore[reportPrivateUsage]
+        parent = doc_part.getparent()
+        if glossary_part is None or parent is None or parent is not (
+            glossary_part.element.docParts
+        ):
+            raise ValueError("`block` is not a building block of this document")
+
+        released = _referenced_rIds(doc_part)
+        parent.remove(doc_part)
+        still_used = _referenced_rIds(glossary_part.element)
+        for rId in released - still_used:
+            if rId in glossary_part.rels:
+                del glossary_part.rels[rId]
+
+    def _add_block(
+        self,
+        name: str,
+        gallery: WD_BUILDING_BLOCK_GALLERY,
+        category: str,
+        description: str | None,
+        types: Iterable[WD_BUILDING_BLOCK_TYPE],
+        behaviors: Iterable[WD_BUILDING_BLOCK_BEHAVIOR],
+    ) -> BuildingBlock:
+        """A newly-added, minimally-populated building block (one empty paragraph)."""
+        if not name:
+            raise ValueError("a building block must have a non-empty name")
+        if self.get(name, gallery=gallery, category=category) is not None:
+            raise ValueError(
+                f"a building block named {name!r} already exists in gallery {gallery.name}"
+                f" and category {category!r}"
+            )
+        glossary_part = self._document_part.get_or_add_glossary_part()
+        doc_parts = glossary_part.element.get_or_add_docParts()
+        doc_part = doc_parts.add_doc_part(name)
+        block = BuildingBlock(doc_part, glossary_part)
+        block.gallery = gallery
+        block.category = category
+        block.description = description
+        block.types = tuple(types)
+        block.behaviors = tuple(behaviors)
+        return block
+
+
+class BuildingBlock(BlockItemContainer):
+    """A single building block: a named, categorized piece of reusable content.
+
+    Its content is accessed like that of a table cell or header, with `.paragraphs`,
+    `.tables`, `.add_paragraph()`, `.add_table()` and `.iter_inner_content()`.
+    """
+
+    def __init__(self, doc_part: CT_DocPart, glossary_part: GlossaryPart):
+        body = doc_part.docPartBody
+        if body is None:
+            body = doc_part.get_or_add_docPartBody()
+            body.add_p()
+        super().__init__(cast("BaseOxmlElement", body), glossary_part)  # pyright: ignore
+        self._doc_part = doc_part
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, BuildingBlock) and other._doc_part is self._doc_part
+
+    def __hash__(self) -> int:
+        return id(self._doc_part)
+
+    def add_table(self, rows: int, cols: int, width=None) -> Table:  # pyright: ignore
+        """Table of `rows` x `cols` added to the end of this building block.
+
+        Like a table cell, a building block must end with a paragraph, so an empty one
+        is added after the table. `width` is distributed evenly across the columns and
+        defaults to 6 inches.
+        """
+        from docx.shared import Inches
+
+        table = super().add_table(rows, cols, width if width is not None else Inches(6))
+        self.add_paragraph()
+        return table
+
+    def append_to(self, container: BlockItemContainer | Document) -> list[Paragraph | Table]:
+        """Copy this building block's content to the end of `container`, return the copies.
+
+        `container` is the |Document| or anything else that holds block items: a table cell,
+        a header or footer, a comment, another building block. In a document body the
+        content goes before the final section properties, so it lands at the end of the
+        last section.
+
+        This is a block-level insertion: every paragraph and table of the block is copied
+        as-is, the block's `behaviors` are not interpreted. Images and hyperlinks are
+        carried over with their relationships. Bookmarks and drawing ids are not
+        renumbered.
+        """
+        from docx.document import Document
+
+        if isinstance(container, Document):
+            container = container._body  # pyright: ignore[reportPrivateUsage]
+        target = container._element  # pyright: ignore[reportPrivateUsage]
+        if target.tag not in _BLOCK_CONTAINER_TAGS:
+            raise TypeError(
+                f"cannot append paragraphs and tables to a {target.tag.split('}')[-1]!r} element"
+            )
+        clones = self._clone_content(container.part)
+        sectPr = target.find(qn("w:sectPr"))
+        for clone in clones:
+            if sectPr is not None:
+                sectPr.addprevious(clone)
+            else:
+                target.append(clone)
+        return [_proxy_for(clone, container) for clone in clones]
+
+    def insert_before(self, item: Paragraph | Table) -> list[Paragraph | Table]:
+        """Copy this building block's content immediately before `item`, return the copies.
+
+        `item` is a |Paragraph| or |Table| in any story (body, cell, header...). See
+        `append_to()` for what is and isn't carried over.
+        """
+        target = item._element  # pyright: ignore[reportPrivateUsage]
+        clones = self._clone_content(item.part)
+        for clone in clones:
+            target.addprevious(clone)
+        parent = item._parent  # pyright: ignore[reportPrivateUsage]
+        return [_proxy_for(clone, parent) for clone in clones]
+
+    @property
+    def behaviors(self) -> tuple[WD_BUILDING_BLOCK_BEHAVIOR, ...]:
+        """How Word inserts this block: a tuple of `WD_BUILDING_BLOCK_BEHAVIOR` members.
+
+        Assigning an empty sequence removes the behaviors element.
+        """
+        pr = self._doc_part.docPartPr
+        return pr.behavior_vals if pr is not None else ()
+
+    @behaviors.setter
+    def behaviors(self, values: Iterable[WD_BUILDING_BLOCK_BEHAVIOR]):
+        self._doc_part.get_or_add_docPartPr().behavior_vals = values
+
+    @property
+    def category(self) -> str | None:
+        """Name of the category this block is listed under, |None| if it has none.
+
+        Assigning a name to a block with no classification also sets its gallery to
+        `WD_BUILDING_BLOCK_GALLERY.DEFAULT`, because the file format requires both.
+        """
+        pr = self._doc_part.docPartPr
+        return pr.category_name if pr is not None else None
+
+    @category.setter
+    def category(self, value: str):
+        self._doc_part.get_or_add_docPartPr().category_name = value
+
+    @property
+    def description(self) -> str | None:
+        """Description shown by Word for this block, |None| if it has none."""
+        pr = self._doc_part.docPartPr
+        return pr.description_val if pr is not None else None
+
+    @description.setter
+    def description(self, value: str | None):
+        self._doc_part.get_or_add_docPartPr().description_val = value
+
+    @property
+    def gallery(self) -> WD_BUILDING_BLOCK_GALLERY | None:
+        """The gallery this block is classified in, |None| if it has none.
+
+        Assigning a gallery to a block with no classification also sets its category to
+        "General", because the file format requires both.
+        """
+        pr = self._doc_part.docPartPr
+        return pr.gallery_val if pr is not None else None
+
+    @gallery.setter
+    def gallery(self, value: WD_BUILDING_BLOCK_GALLERY):
+        self._doc_part.get_or_add_docPartPr().gallery_val = value
+
+    @property
+    def guid(self) -> str | None:
+        """The GUID Word uses to identify this block, like `{6F9619FF-...}`, or |None|."""
+        pr = self._doc_part.docPartPr
+        return pr.guid_val if pr is not None else None
+
+    @property
+    def name(self) -> str:
+        """The name of this building block, which is what Word shows in its galleries.
+
+        Not checked for uniqueness when assigned; use `BuildingBlocks.get()` first if a
+        clash matters.
+        """
+        pr = self._doc_part.docPartPr
+        return pr.name_val if pr is not None else ""
+
+    @name.setter
+    def name(self, value: str):
+        if not value:
+            raise ValueError("a building block must have a non-empty name")
+        self._doc_part.get_or_add_docPartPr().name_val = value
+
+    @property
+    def text(self) -> str:
+        """The text of this block's paragraphs, one per line. Tables are not included."""
+        return "\n".join(p.text for p in self.paragraphs)
+
+    @property
+    def types(self) -> tuple[WD_BUILDING_BLOCK_TYPE, ...]:
+        """The block's types: a tuple of `WD_BUILDING_BLOCK_TYPE` members.
+
+        Assigning an empty sequence removes the types element.
+        """
+        pr = self._doc_part.docPartPr
+        return pr.type_vals if pr is not None else ()
+
+    @types.setter
+    def types(self, values: Iterable[WD_BUILDING_BLOCK_TYPE]):
+        self._doc_part.get_or_add_docPartPr().type_vals = values
+
+    def _clone_content(self, dest_part: StoryPart) -> list[BaseOxmlElement]:
+        """Deep copies of this block's paragraphs and tables, relationships re-pointed.
+
+        Relationships the content depends on (images, hyperlinks...) belong to the glossary
+        part; the copies are given equivalent relationships on `dest_part`.
+        """
+        clones = [
+            copy.deepcopy(e)
+            for e in self._element.inner_content_elements  # pyright: ignore
+        ]
+        _remap_relationships(clones, self.part, dest_part)
+        return clones
+
+
+def _proxy_for(element: BaseOxmlElement, parent) -> Paragraph | Table:
+    """A |Paragraph| or |Table| proxy for the `w:p` or `w:tbl` `element`."""
+    if isinstance(element, CT_P):
+        return Paragraph(element, parent)
+    return Table(cast(CT_Tbl, element), parent)
+
+
+def _referenced_rIds(root: BaseOxmlElement) -> set[str]:
+    """Every relationship id referenced by an `r:`-namespace attribute at or below `root`."""
+    return {
+        value
+        for element in root.iter()
+        for name, value in element.attrib.items()
+        if name.startswith(_R_NS_PREFIX)
+    }
+
+
+def _remap_relationships(
+    elements: Iterable[BaseOxmlElement], src_part: StoryPart, dest_part: StoryPart
+) -> None:
+    """Re-point relationship references in `elements` from `src_part` to `dest_part`.
+
+    `elements` are copies that were taken from `src_part`, so their `r:id`, `r:embed` and
+    other `r:`-namespace attributes hold relationship ids that are only meaningful there.
+    For each, an equivalent relationship (same type, same target, internal or external) is
+    obtained on `dest_part` and the attribute updated to its id.
+    """
+    if src_part is dest_part:
+        return
+    for root in elements:
+        for element in root.iter():
+            for attr_name, rId in list(element.attrib.items()):
+                if not attr_name.startswith(_R_NS_PREFIX):
+                    continue
+                rel = src_part.rels.get(rId)
+                if rel is None:
+                    continue
+                if rel.is_external:
+                    new_rId = dest_part.relate_to(rel.target_ref, rel.reltype, is_external=True)
+                else:
+                    new_rId = dest_part.relate_to(rel.target_part, rel.reltype)
+                element.set(attr_name, new_rId)

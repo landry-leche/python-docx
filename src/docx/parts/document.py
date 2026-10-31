@@ -5,8 +5,10 @@ from __future__ import annotations
 from typing import IO, TYPE_CHECKING, cast
 
 from docx.document import Document
+from docx.building_blocks import BuildingBlocks
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.parts.comments import CommentsPart
+from docx.parts.glossary import GlossaryPart
 from docx.parts.hdrftr import FooterPart, HeaderPart
 from docx.parts.numbering import NumberingPart
 from docx.parts.settings import SettingsPart
@@ -43,6 +45,15 @@ class DocumentPart(StoryPart):
         header_part = HeaderPart.new(self.package)
         rId = self.relate_to(header_part, RT.HEADER)
         return header_part, rId
+
+    @property
+    def building_blocks(self) -> BuildingBlocks:
+        """|BuildingBlocks| collection of the building blocks (Quick Parts etc.) in this document.
+
+        Accessing the collection does not create a glossary part; that happens when the
+        first building block is added.
+        """
+        return BuildingBlocks(self)
 
     @property
     def comments(self) -> Comments:
@@ -85,6 +96,23 @@ class DocumentPart(StoryPart):
         wrong type or names a style not present in the document.
         """
         return self.styles.get_style_id(style_or_name, style_type)
+
+    @property
+    def glossary_part(self) -> GlossaryPart | None:
+        """The |GlossaryPart| holding this document's building blocks, |None| if it has none."""
+        try:
+            return cast(GlossaryPart, self.part_related_by(RT.GLOSSARY_DOCUMENT))
+        except KeyError:
+            return None
+
+    def get_or_add_glossary_part(self) -> GlossaryPart:
+        """The |GlossaryPart| of this document, a new empty one if it doesn't have one."""
+        glossary_part = self.glossary_part
+        if glossary_part is None:
+            assert self.package is not None
+            glossary_part = GlossaryPart.default(self.package)
+            self.relate_to(glossary_part, RT.GLOSSARY_DOCUMENT)
+        return glossary_part
 
     def header_part(self, rId: str):
         """Return |HeaderPart| related by `rId`."""

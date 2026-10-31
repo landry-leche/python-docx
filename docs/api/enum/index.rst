@@ -11,6 +11,9 @@ can be found here:
    MsoColorType
    MsoThemeColorIndex
    WdAlignParagraph
+   WdBuildingBlockBehavior
+   WdBuildingBlockGallery
+   WdBuildingBlockType
    WdBuiltinStyle
    WdCellVerticalAlignment
    WdColorIndex

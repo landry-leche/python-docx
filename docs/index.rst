@@ -82,6 +82,7 @@ User Guide
    user/styles-understanding
    user/styles-using
    user/comments
+   user/building-blocks
    user/shapes
 
 
@@ -98,6 +99,7 @@ API Documentation
    api/table
    api/section
    api/comments
+   api/building_blocks
    api/shape
    api/dml
    api/shared

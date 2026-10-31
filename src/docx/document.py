@@ -16,6 +16,7 @@ from docx.text.run import Run
 
 if TYPE_CHECKING:
     import docx.types as t
+    from docx.building_blocks import BuildingBlocks
     from docx.comments import Comment, Comments
     from docx.oxml.document import CT_Body, CT_Document
     from docx.parts.document import DocumentPart
@@ -156,6 +157,16 @@ class Document(ElementProxy):
         table = self._body.add_table(rows, cols, self._block_width)
         table.style = style
         return table
+
+    @property
+    def building_blocks(self) -> BuildingBlocks:
+        """A |BuildingBlocks| object providing access to the building blocks of the document.
+
+        Building blocks are what Word shows as Quick Parts, AutoText, cover pages, headers,
+        footers, equations and so on. They are stored in the document's glossary part, which
+        is only created when the first building block is added.
+        """
+        return self._part.building_blocks
 
     @property
     def comments(self) -> Comments:

@@ -91,6 +91,30 @@ from .comments import CT_Comments, CT_Comment
 register_element_cls("w:comments", CT_Comments)
 register_element_cls("w:comment", CT_Comment)
 
+from .glossary import (
+    CT_DocPart,
+    CT_DocPartBehaviors,
+    CT_DocPartBody,
+    CT_DocPartCategory,
+    CT_DocPartGallery,
+    CT_DocParts,
+    CT_DocPartPr,
+    CT_DocPartTypes,
+    CT_GlossaryDocument,
+)
+
+register_element_cls("w:behaviors", CT_DocPartBehaviors)
+register_element_cls("w:category", CT_DocPartCategory)
+register_element_cls("w:description", CT_String)
+register_element_cls("w:docPart", CT_DocPart)
+register_element_cls("w:docPartBody", CT_DocPartBody)
+register_element_cls("w:docPartPr", CT_DocPartPr)
+register_element_cls("w:docParts", CT_DocParts)
+register_element_cls("w:gallery", CT_DocPartGallery)
+register_element_cls("w:glossaryDocument", CT_GlossaryDocument)
+register_element_cls("w:guid", CT_String)
+register_element_cls("w:types", CT_DocPartTypes)
+
 from .coreprops import CT_CoreProperties
 
 register_element_cls("cp:coreProperties", CT_CoreProperties)
