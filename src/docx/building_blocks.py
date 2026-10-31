@@ -8,6 +8,7 @@ document*, a part related to the main document part.
 from __future__ import annotations
 
 import copy
+import io
 from typing import TYPE_CHECKING, Iterable, Iterator, Sequence, cast
 
 from docx.blkcntnr import BlockItemContainer
@@ -16,8 +17,10 @@ from docx.enum.building_block import (
     WD_BUILDING_BLOCK_GALLERY,
     WD_BUILDING_BLOCK_TYPE,
 )
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml.glossary import DEFAULT_CATEGORY_NAME
 from docx.oxml.ns import nsmap, qn
+from docx.oxml.parser import OxmlElement
 from docx.oxml.table import CT_Tbl
 from docx.oxml.text.paragraph import CT_P
 from docx.table import Table
@@ -32,6 +35,9 @@ if TYPE_CHECKING:
     from docx.parts.story import StoryPart
 
 _R_NS_PREFIX = "{%s}" % nsmap["r"]
+
+# -- children of a story that hold properties rather than content --
+_KEPT_WHEN_REPLACING = frozenset((qn("w:sectPr"), qn("w:tcPr")))
 
 # -- the elements `append_to()` knows to be block-item containers --
 _BLOCK_CONTAINER_TAGS = frozenset(
@@ -248,7 +254,9 @@ class BuildingBlock(BlockItemContainer):
         self.add_paragraph()
         return table
 
-    def append_to(self, container: BlockItemContainer | Document) -> list[Paragraph | Table]:
+    def append_to(
+        self, container: BlockItemContainer | Document, *, replace: bool = False
+    ) -> list[Paragraph | Table]:
         """Copy this building block's content to the end of `container`, return the copies.
 
         `container` is the |Document| or anything else that holds block items: a table cell,
@@ -256,10 +264,21 @@ class BuildingBlock(BlockItemContainer):
         content goes before the final section properties, so it lands at the end of the
         last section.
 
-        This is a block-level insertion: every paragraph and table of the block is copied
-        as-is, the block's `behaviors` are not interpreted. Images and hyperlinks are
-        carried over with their relationships. Bookmarks and drawing ids are not
-        renumbered.
+        With `replace=True` the existing content of `container` is removed first, so that
+        the block *becomes* the content. That is what Word does when you pick a block from
+        its Header or Footer gallery. It is not allowed for the document body itself
+        (|ValueError|). Whatever the container, a story always ends with a paragraph: if
+        the block's content would leave it ending with a table, an empty paragraph is added.
+
+        Beware of headers and footers that are *linked to the previous section*: reading
+        or writing one reaches the header of the section it inherits from, so appending to
+        every section's header would add the block to the same header several times. Check
+        `is_linked_to_previous` first, as shown in the user guide.
+
+        This is a block-level insertion: every paragraph, table and content control of the
+        block is copied as-is, the block's `behaviors` are not interpreted. Images and
+        hyperlinks are carried over with their relationships. Bookmarks and drawing ids are
+        not renumbered, and styles the content uses are not imported into the destination.
         """
         from docx.document import Document
 
@@ -270,14 +289,23 @@ class BuildingBlock(BlockItemContainer):
             raise TypeError(
                 f"cannot append paragraphs and tables to a {target.tag.split('}')[-1]!r} element"
             )
+        if replace and target.tag == qn("w:body"):
+            raise ValueError("`replace=True` is not supported for the document body")
         clones = self._clone_content(container.part)
+        if replace:
+            for child in list(target):
+                if child.tag not in _KEPT_WHEN_REPLACING:
+                    target.remove(child)
         sectPr = target.find(qn("w:sectPr"))
         for clone in clones:
             if sectPr is not None:
                 sectPr.addprevious(clone)
             else:
                 target.append(clone)
-        return [_proxy_for(clone, container) for clone in clones]
+        if target.tag != qn("w:body"):
+            _ensure_ends_with_paragraph(target)
+        proxies = (_proxy_for(clone, container) for clone in clones)
+        return [proxy for proxy in proxies if proxy is not None]
 
     def insert_before(self, item: Paragraph | Table) -> list[Paragraph | Table]:
         """Copy this building block's content immediately before `item`, return the copies.
@@ -290,7 +318,8 @@ class BuildingBlock(BlockItemContainer):
         for clone in clones:
             target.addprevious(clone)
         parent = item._parent  # pyright: ignore[reportPrivateUsage]
-        return [_proxy_for(clone, parent) for clone in clones]
+        proxies = (_proxy_for(clone, parent) for clone in clones)
+        return [proxy for proxy in proxies if proxy is not None]
 
     @property
     def behaviors(self) -> tuple[WD_BUILDING_BLOCK_BEHAVIOR, ...]:
@@ -384,24 +413,39 @@ class BuildingBlock(BlockItemContainer):
         self._doc_part.get_or_add_docPartPr().type_vals = values
 
     def _clone_content(self, dest_part: StoryPart) -> list[BaseOxmlElement]:
-        """Deep copies of this block's paragraphs and tables, relationships re-pointed.
+        """Deep copies of everything this block contains, relationships re-pointed.
 
+        That is every block-level child of the body, so paragraphs and tables but also
+        content controls (`w:sdt`), which the built-in header and footer blocks use.
         Relationships the content depends on (images, hyperlinks...) belong to the glossary
         part; the copies are given equivalent relationships on `dest_part`.
         """
         clones = [
             copy.deepcopy(e)
-            for e in self._element.inner_content_elements  # pyright: ignore
+            for e in self._element.content_elements  # pyright: ignore
         ]
         _remap_relationships(clones, self.part, dest_part)
         return clones
 
 
-def _proxy_for(element: BaseOxmlElement, parent) -> Paragraph | Table:
-    """A |Paragraph| or |Table| proxy for the `w:p` or `w:tbl` `element`."""
+def _ensure_ends_with_paragraph(story: BaseOxmlElement) -> None:
+    """Make sure the block-level content of `story` ends with a paragraph.
+
+    Word requires that of table cells, headers, footers, comments and the like, and
+    repairs the file (or refuses to open it) when it isn't so.
+    """
+    content = [child for child in story if child.tag not in _KEPT_WHEN_REPLACING]
+    if not content or content[-1].tag != qn("w:p"):
+        story.append(OxmlElement("w:p"))
+
+
+def _proxy_for(element: BaseOxmlElement, parent) -> Paragraph | Table | None:
+    """A |Paragraph| or |Table| proxy for `element`, |None| for any other kind of element."""
     if isinstance(element, CT_P):
         return Paragraph(element, parent)
-    return Table(cast(CT_Tbl, element), parent)
+    if isinstance(element, CT_Tbl):
+        return Table(element, parent)
+    return None
 
 
 def _referenced_rIds(root: BaseOxmlElement) -> set[str]:
@@ -423,9 +467,17 @@ def _remap_relationships(
     other `r:`-namespace attributes hold relationship ids that are only meaningful there.
     For each, an equivalent relationship (same type, same target, internal or external) is
     obtained on `dest_part` and the attribute updated to its id.
+
+    When the two parts belong to different packages (a block taken from a template, say),
+    a part cannot simply be shared: its part-name, like `/word/media/image1.png`, may
+    already be taken by a different part in the destination package. Images are therefore
+    added to the destination package afresh, which names them uniquely and reuses an
+    identical image the destination already has. Other kinds of internal target cannot be
+    copied between packages yet and raise |ValueError|.
     """
     if src_part is dest_part:
         return
+    same_package = src_part.package is dest_part.package
     for root in elements:
         for element in root.iter():
             for attr_name, rId in list(element.attrib.items()):
@@ -436,6 +488,13 @@ def _remap_relationships(
                     continue
                 if rel.is_external:
                     new_rId = dest_part.relate_to(rel.target_ref, rel.reltype, is_external=True)
-                else:
+                elif same_package:
                     new_rId = dest_part.relate_to(rel.target_part, rel.reltype)
+                elif rel.reltype == RT.IMAGE:
+                    new_rId, _ = dest_part.get_or_add_image(io.BytesIO(rel.target_part.blob))
+                else:
+                    kind = rel.reltype.rsplit("/", 1)[-1]
+                    raise ValueError(
+                        f"cannot copy content with a {kind!r} relationship between documents"
+                    )
                 element.set(attr_name, new_rId)

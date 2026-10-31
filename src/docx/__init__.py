@@ -51,6 +51,8 @@ PartFactory.part_type_for[CT.WML_HEADER] = HeaderPart
 PartFactory.part_type_for[CT.WML_NUMBERING] = NumberingPart
 PartFactory.part_type_for[CT.WML_SETTINGS] = SettingsPart
 PartFactory.part_type_for[CT.WML_STYLES] = StylesPart
+PartFactory.part_type_for[CT.WML_TEMPLATE_MAIN] = DocumentPart
+PartFactory.part_type_for[CT.WML_TEMPLATE_MAIN_MACRO_ENABLED] = DocumentPart
 
 del (
     CT,

@@ -329,3 +329,17 @@ class CT_DocPartBody(BaseOxmlElement):
     def inner_content_elements(self) -> List[CT_P | CT_Tbl]:
         """All `w:p` and `w:tbl` child elements, in document order."""
         return self.xpath("./w:p | ./w:tbl")
+
+    @property
+    def content_elements(self) -> List[BaseOxmlElement]:
+        """Every child element that is content, in order: all but the final `w:sectPr`.
+
+        Unlike `.inner_content_elements` this includes block-level content controls
+        (`w:sdt`), bookmarks and any other block-level element, which a faithful copy of
+        the block needs.
+        """
+        return [
+            child
+            for child in self
+            if isinstance(child.tag, str) and child.tag != qn("w:sectPr")
+        ]

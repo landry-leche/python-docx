@@ -146,6 +146,12 @@ class CONTENT_TYPE:
     )
     WML_SETTINGS = "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"
     WML_STYLES = "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"
+    WML_TEMPLATE_MAIN = (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml"
+    )
+    WML_TEMPLATE_MAIN_MACRO_ENABLED = (
+        "application/vnd.ms-word.template.macroEnabledTemplate.main+xml"
+    )
     WML_WEB_SETTINGS = (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.webSettings+xml"
     )

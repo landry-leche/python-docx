@@ -14,10 +14,10 @@ library of boilerplate in a document and assemble new documents from it.
 
 .. note::
 
-   Building blocks are accessed through a :class:`.Document` object. Word usually keeps its
-   built-in galleries in *template* files (``.dotx`` and ``.dotm``), which
-   :func:`docx.Document` does not open; see :ref:`building_blocks_limitations`. A
-   ``.docx`` file can hold building blocks too, and that is what this page works with.
+   Building blocks are accessed through a :class:`.Document` object. Word keeps its
+   galleries in *template* files (``.dotx`` and ``.dotm``), and :func:`docx.Document` opens
+   those like any other document; see :ref:`building_blocks_templates`. A ``.docx`` file can
+   hold building blocks too, and that is what most of this page works with.
 
 
 Building block anatomy
@@ -243,8 +243,57 @@ share a library of blocks between documents::
     ['Best regards,', 'Jane Doe']
 
 Insertion is *block-level*: every paragraph and table of the block is copied exactly as it is
-stored. In particular, the block's ``behaviors`` (which tell Word to insert inline, as a
-paragraph, or on a new page) are not applied. If you want a page break, add one yourself.
+stored, together with any content controls (``w:sdt``) the block contains. In particular, the
+block's ``behaviors`` (which tell Word to insert inline, as a paragraph, or on a new page) are
+not applied. If you want a page break, add one yourself.
+
+``append_to()`` adds after what the container already holds. Pass ``replace=True`` to
+discard the existing content first, which is usually what you want for a header or a footer.
+A table cell keeps its properties (width, shading, ...) when replaced. The container always
+ends with a paragraph, because Word requires one after a table. ``replace=True`` is refused
+for the document body, to protect the document::
+
+    >>> header = document.sections[0].header
+    >>> header.is_linked_to_previous = False
+    >>> copies = disclaimer.append_to(header, replace=True)
+    >>> [paragraph.text for paragraph in header.paragraphs]
+    ['This message is confidential.']
+
+Pictures follow the block into the destination, including when it is in another file. They
+are re-added to the destination package, so two documents that each call their image
+``image1.png`` do not collide. Other kinds of internal relationship (embedded objects, for
+example) cannot be copied between documents and raise :exc:`ValueError`.
+
+
+.. _building_blocks_templates:
+
+Using the building blocks of a template
+---------------------------------------
+
+Word keeps its building blocks mostly in templates: ``.dotx`` files, or ``.dotm`` when they
+contain macros. :func:`docx.Document` opens both like a regular document, and saving writes a
+template again, not a ``.docx``::
+
+    >>> template = Document("company.dotx")                  # doctest: +SKIP
+    >>> footer_block = template.building_blocks.get("Company footer")  # doctest: +SKIP
+
+A common job is to put one such block in the headers or footers of the sections of an
+existing ``.docx``. A section whose header (or footer) is *linked to previous* shows the one
+of an earlier section, so appending to every section would repeat the content in the shared
+one. Fill only the headers and footers that are not linked::
+
+    >>> target = Document("report.docx")                      # doctest: +SKIP
+    >>> for section in target.sections:                       # doctest: +SKIP
+    ...     for header_footer in (section.header, section.footer):
+    ...         if not header_footer.is_linked_to_previous:
+    ...             footer_block.append_to(header_footer, replace=True)
+    >>> target.save("report-with-footer.docx")                # doctest: +SKIP
+
+To give every section its own copy, set ``is_linked_to_previous = False`` first. The first-page
+and even-page headers and footers (:attr:`.Section.first_page_header`,
+:attr:`.Section.even_page_footer`, ...) work the same way.
+
+Open a *copy* of a template you are reading from; do not do it while Word has it open.
 
 
 Changing a building block
@@ -306,12 +355,14 @@ not manage, such as the styles and settings Word stores alongside the blocks.
 Limitations
 -----------
 
-- **Templates.** ``docx.Document()`` opens only documents whose main part is a regular
-  ``.docx`` document, so it raises :exc:`ValueError` for ``.dotx`` and ``.dotm`` templates.
-  That is where Word keeps its built-in galleries and the ``Normal`` template's custom
-  Quick Parts, so those cannot be reached directly yet.
-- **Styles.** A glossary created by *python-docx* has no styles of its own. Paragraph and
-  character styles named in a block are looked up in the main document's styles.
+- **Styles.** A glossary created by *python-docx* has no styles of its own, and styles are
+  not copied when a block is inserted into another document. Paragraph and character styles
+  named in a block are looked up in the destination's styles; if it lacks one, Word falls
+  back to the default style. Direct formatting is copied as is.
+- **Other relationships.** Between documents, only pictures, hyperlinks and other external
+  targets are carried over.
+- **Not validated in Word.** The behaviour was tested against files made by *python-docx*,
+  not against Word's own templates.
 - **Insertion is a copy, not an expansion.** The block's ``behaviors`` are not interpreted
   (see above). Bookmark ids and drawing ids are not renumbered when content is copied, so
   inserting the same block several times repeats them.
