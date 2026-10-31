@@ -330,3 +330,111 @@ class DescribeTheWholeScenario:
         assert _texts(footers[2]) == ["ACME Corp - Confidential"]
         assert saved.part.content_type == CT.WML_DOCUMENT_MAIN
         assert saved.part.glossary_part is None  # -- the template's glossary stays behind --
+
+
+class DescribeStylesOfInsertedBlocks:
+    """Like Word, inserting a block brings along the styles it uses."""
+
+    def _styled_block(self):
+        source = Document()
+        style = source.styles.add_style("Banner Style", 1)  # -- paragraph style --
+        style.font.bold = True
+        child = source.styles.add_style("Banner Child", 1)
+        child.base_style = style
+        child.next_paragraph_style = style
+        paragraph = source.add_paragraph("styled", style="Banner Child")
+        return source, source.building_blocks.add_from("Banner", [paragraph])
+
+    def it_imports_the_styles_a_block_uses_with_the_styles_they_depend_on(self):
+        _, block = self._styled_block()
+        target = Document()
+        footer = target.sections[0].footer
+        footer.is_linked_to_previous = False
+
+        (copy,) = block.append_to(footer, replace=True)
+
+        assert copy.style.name == "Banner Child"
+        assert copy.style.base_style.name == "Banner Style"
+        assert copy.style.base_style.font.bold is True
+        assert copy.style.next_paragraph_style.name == "Banner Style"
+
+    def it_leaves_a_style_the_target_already_has_alone(self):
+        _, block = self._styled_block()
+        target = Document()
+        mine = target.styles.add_style("Banner Style", 1)
+        mine.font.italic = True
+        header = target.sections[0].header
+        header.is_linked_to_previous = False
+
+        (copy,) = block.append_to(header, replace=True)
+
+        base = copy.style.base_style
+        assert base.font.italic is True and base.font.bold is None
+        assert len([s for s in target.styles if s.name == "Banner Style"]) == 1
+
+    def it_gives_an_imported_style_a_new_id_when_the_id_is_taken_by_another_style(self):
+        source = Document()
+        source.styles.add_style("Alpha", 1)  # -- style id "Alpha" --
+        block = source.building_blocks.add_from(
+            "B", [source.add_paragraph("x", style="Alpha")]
+        )
+        target = Document()
+        target.styles.add_style("Other", 1).name  # -- distinct name... --
+        target.styles["Other"]._element.styleId = "Alpha"  # -- ...but the id Alpha --
+        footer = target.sections[0].footer
+        footer.is_linked_to_previous = False
+
+        (copy,) = block.append_to(footer, replace=True)
+
+        assert copy.style.name == "Alpha"
+        assert copy.style.style_id != "Other" and copy.style.style_id != "Alpha"
+
+    def it_does_not_import_a_second_default_style(self):
+        source = Document()
+        source.styles.add_style("Fancy", 1)
+        source.styles["Fancy"]._element.default = True
+        block = source.building_blocks.add_from("B", [source.add_paragraph("x", style="Fancy")])
+        target = Document()
+        footer = target.sections[0].footer
+        footer.is_linked_to_previous = False
+
+        block.append_to(footer, replace=True)
+
+        defaults = [s for s in target.styles if s.type == 1 and s._element.default]
+        assert [s.name for s in defaults] == ["Normal"]
+
+    def it_imports_styles_from_the_styles_part_of_a_template_glossary(self):
+        # -- a block whose glossary has its own styles part, as in Word templates --
+        doc = Document()
+        doc.building_blocks.add("B", "x")
+        glossary = doc.part.glossary_part
+        styles_part = doc.part.part_related_by(RT.STYLES).__class__.default(doc.part.package)
+        styles_part.partname = glossary.package.next_partname("/word/glossary/styles%d.xml")
+        styles_part.element.append(
+            parse_xml(
+                f'<w:style xmlns:w="{W_NS}" w:type="paragraph" w:customStyle="1" '
+                'w:styleId="GlossOnly"><w:name w:val="Gloss Only"/><w:rPr><w:b/></w:rPr>'
+                "</w:style>"
+            )
+        )
+        glossary.relate_to(styles_part, RT.STYLES)
+        block = doc.building_blocks.get("B")
+        block.paragraphs[0]._p.get_or_add_pPr().get_or_add_pStyle().val = "GlossOnly"
+        target = Document()
+        footer = target.sections[0].footer
+        footer.is_linked_to_previous = False
+
+        (copy,) = block.append_to(footer, replace=True)
+
+        assert copy.style.name == "Gloss Only"
+        assert copy.style.font.bold is True
+
+    def it_changes_nothing_when_the_block_uses_no_style(self):
+        source = Document()
+        block = source.building_blocks.add("Plain", "text")
+        target = Document()
+        before = len(list(target.styles))
+
+        block.append_to(target)
+
+        assert len(list(target.styles)) == before

@@ -259,6 +259,12 @@ for the document body, to protect the document::
     >>> [paragraph.text for paragraph in header.paragraphs]
     ['This message is confidential.']
 
+Styles follow the block too. The paragraph, character and table styles its content uses
+are looked up in the block's own document (the glossary's styles first), and those the
+destination does not have are added to it together with the styles they depend on. A style
+the destination already has under the same name is left unchanged and the inserted content
+uses it, as in Word.
+
 Pictures follow the block into the destination, including when it is in another file. They
 are re-added to the destination package, so two documents that each call their image
 ``image1.png`` do not collide. Other kinds of internal relationship (embedded objects, for
@@ -355,10 +361,11 @@ not manage, such as the styles and settings Word stores alongside the blocks.
 Limitations
 -----------
 
-- **Styles.** A glossary created by *python-docx* has no styles of its own, and styles are
-  not copied when a block is inserted into another document. Paragraph and character styles
-  named in a block are looked up in the destination's styles; if it lacks one, Word falls
-  back to the default style. Direct formatting is copied as is.
+- **Styles are imported by name, destination wins.** Like Word, inserting a block brings
+  along the styles its content uses that the destination lacks, with the styles they are
+  based on, followed by (``next``) or linked to. A style the destination already has (same
+  name and type) is kept as it is there, so the block takes on the target's look for it.
+  Numbering definitions and theme fonts used by an imported style are not copied.
 - **Other relationships.** Between documents, only pictures, hyperlinks and other external
   targets are carried over.
 - **Not validated in Word.** The behaviour was tested against files made by *python-docx*,

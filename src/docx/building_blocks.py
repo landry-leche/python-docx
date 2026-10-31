@@ -277,8 +277,10 @@ class BuildingBlock(BlockItemContainer):
 
         This is a block-level insertion: every paragraph, table and content control of the
         block is copied as-is, the block's `behaviors` are not interpreted. Images and
-        hyperlinks are carried over with their relationships. Bookmarks and drawing ids are
-        not renumbered, and styles the content uses are not imported into the destination.
+        hyperlinks are carried over with their relationships. Styles the content uses that the
+        destination does not have are imported into it, as Word does; a style the destination
+        already has (same name) is left as it is there. Bookmarks and drawing ids are not
+        renumbered.
         """
         from docx.document import Document
 
@@ -425,6 +427,7 @@ class BuildingBlock(BlockItemContainer):
             for e in self._element.content_elements  # pyright: ignore
         ]
         _remap_relationships(clones, self.part, dest_part)
+        _import_styles(clones, self.part, dest_part)
         return clones
 
 
@@ -498,3 +501,92 @@ def _remap_relationships(
                         f"cannot copy content with a {kind!r} relationship between documents"
                     )
                 element.set(attr_name, new_rId)
+
+
+_STYLE_REFERENCE_TAGS = ("w:pStyle", "w:rStyle", "w:tblStyle")
+
+
+def _styles_element_of(part: StoryPart):
+    """The `w:styles` element related to `part`, or |None| when it has none.
+
+    A building block's own styles part is related to the glossary part.
+    """
+    try:
+        return part.part_related_by(RT.STYLES).element  # pyright: ignore
+    except KeyError:
+        return None
+
+
+def _import_styles(
+    clones: Sequence[BaseOxmlElement], src_part: StoryPart, dest_part: StoryPart
+) -> None:
+    """Make the styles `clones` refer to exist in `dest_part`'s document.
+
+    Word keeps the formatting of a building block when it is inserted: styles the target
+    lacks are brought along, together with the styles they are based on, are followed by
+    (`w:next`) or linked to. A style the destination already has, matched by name, wins and
+    the references in `clones` are pointed at its id. Definitions are looked for in the
+    glossary's own styles first, then in the styles of the block's document.
+    """
+    tags = [qn(tag) for tag in _STYLE_REFERENCE_TAGS]
+    references = [ref for clone in clones for ref in clone.iter(*tags)]
+    if not references:
+        return
+    sources = [
+        e
+        for e in (
+            _styles_element_of(src_part),
+            _styles_element_of(src_part._document_part),  # pyright: ignore
+        )
+        if e is not None
+    ]
+    dest_document_part = dest_part._document_part  # pyright: ignore[reportPrivateUsage]
+    dest_styles = _styles_element_of(dest_document_part)
+    sources = [e for e in sources if e is not dest_styles]
+    if not sources:
+        return
+    dest = dest_document_part._styles_part.element  # pyright: ignore[reportPrivateUsage]
+    mapping: dict[str, str] = {}
+
+    def find_source(style_id: str):
+        for styles in sources:
+            style = styles.get_by_id(style_id)
+            if style is not None:
+                return style
+        return None
+
+    def bring(style_id: str) -> str:
+        """Id in the destination of the style that `style_id` is in the source."""
+        if style_id in mapping:
+            return mapping[style_id]
+        source = find_source(style_id)
+        if source is None:
+            mapping[style_id] = style_id
+            return style_id
+        name = (source.name_val or "").lower()
+        for existing in dest.xpath("w:style"):
+            if (existing.name_val or "").lower() == name and existing.type == source.type:
+                mapping[style_id] = existing.styleId or style_id
+                return mapping[style_id]
+        new_id = style_id
+        taken = {s.styleId for s in dest.xpath("w:style")}
+        counter = 2
+        while new_id in taken:
+            new_id = f"{style_id}{counter}"
+            counter += 1
+        mapping[style_id] = new_id
+        style = copy.deepcopy(source)
+        style.styleId = new_id
+        style.default = None  # -- there is one default style per type; it is the target's --
+        dest.append(style)
+        for tag in ("w:basedOn", "w:next", "w:link"):
+            related = style.find(qn(tag))
+            val = related.get(qn("w:val")) if related is not None else None
+            if related is not None and val:
+                related.set(qn("w:val"), bring(val))
+        return new_id
+
+    for ref in references:
+        style_id = ref.get(qn("w:val"))
+        if style_id:
+            ref.set(qn("w:val"), bring(style_id))
